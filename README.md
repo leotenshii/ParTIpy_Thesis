@@ -1,1 +1,1 @@
-# ParTIpy_Thesis
+# partipy
