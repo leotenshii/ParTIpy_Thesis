@@ -1,39 +1,35 @@
 """Functions to calculate which features (e.g. genes or covariates) are enriched at each archetype."""
 
-from math import pi
-
-import matplotlib.pyplot as plt
+import anndata
 import numpy as np
 import pandas as pd
-import plotnine as pn
-import scanpy as sc
 from scipy.spatial.distance import cdist
 
+from .paretoti import _validate_aa_config, _validate_aa_results
 
-def calculate_weights(
-    X: np.ndarray | sc.AnnData,
-    Z: np.ndarray | None = None,
+
+def compute_archetype_weights(
+    adata: anndata.AnnData,
     mode: str = "automatic",
     length_scale: None | float = None,
-) -> None | tuple[np.ndarray | None]:
+    save_to_anndata: bool = True,
+) -> None | np.ndarray:
     """
-    Calculate weights for cells based on their distance to archetypes using a squared exponential kernel.
+    Calculate weights for the data points based on their distance to archetypes using a squared exponential kernel.
 
     Parameters
     ----------
-    X : Union[np.ndarray, sc.AnnData]
-        The input data, which can be either:
-        - A 2D array of shape (n_samples, n_features) representing the PCA coordinates of the cells.
-        - An AnnData object containing the PCA coordinates in `.obsm["X_pca"]` and archetypes in `.uns["archetypal_analysis"]["Z"]`.
-    Z : np.ndarray, optional
-        A 2D array of shape (n_archetypes, n_features) representing the PCA coordinates of the archetypes.
-        Required if `X` is not an AnnData object.
-    mode : str, optional (default="automatic")
+    adata : anndata.AnnData
+        An AnnData object containing the data and archetypes. The data should be stored in `adata.obsm[obsm_key]`
+        and the archetypes in `adata.uns["AA_results"]["Z"]`.
+    mode : str, default `automatic`
         The mode for determining the length scale of the kernel:
         - "automatic": The length scale is calculated as half the median distance from the data centroid to the archetypes.
         - "manual": The length scale is provided by the user via the `length_scale` parameter.
-    length_scale : float, optional
-        The length scale of the kernel. Required if `mode="manual"`.
+    length_scale : float, default `None`
+        If `mode="manual"`, this is the user-defined length scale for the kernel. If `mode="automatic"`, it is calculated automatically.
+    save_to_anndata : bool, default `True`
+        If `True`, the weights are saved to `adata.obsm["cell_weights"]`. If `False`, the function returns the weights as a numpy array.
 
     Returns
     -------
@@ -41,17 +37,14 @@ def calculate_weights(
         - If `X` is an AnnData object, the weights are added to `X.obsm["cell_weights"]` and nothing is returned.
         - If `X` is a numpy array, a 2D array of shape (n_samples, n_archetypes) representing the weights for each cell-archetype pair.
     """
-    # Handle and validate input data
-    adata = None
-    if isinstance(X, sc.AnnData):
-        adata = X
-        if "archetypal_analysis" not in X.uns:
-            raise ValueError("Result from Archetypal Analysis not found in adata.uns. Please run AA()")
-        Z = X.uns["archetypal_analysis"]["Z"]
-        X = X.obsm["X_pca"][:, : X.uns["n_pcs"]]
+    # input validation
+    _validate_aa_config(adata=adata)
+    _validate_aa_results(adata=adata)
 
-    if Z is None:
-        raise ValueError("Please add the archetypes coordinates as input Z")
+    obsm_key = adata.uns["AA_config"]["obsm_key"]
+    n_dimensions = adata.uns["AA_config"]["n_dimensions"]
+    X = adata.obsm[obsm_key][:, n_dimensions]
+    Z = adata.uns["AA_results"]["Z"]
 
     # Calculate or validate length_scale based on mode
     if mode == "automatic":
@@ -67,90 +60,103 @@ def calculate_weights(
     # Weight calculation
     euclidean_dist = cdist(X, Z)
     weights = np.exp(-(euclidean_dist**2) / (2 * length_scale**2))  # type: ignore[operator]
+    weights = weights.astype(np.float32)
 
-    if isinstance(adata, sc.AnnData):
+    if save_to_anndata:
         adata.obsm["cell_weights"] = weights
         return None
     else:
         return weights
 
 
-def weighted_expr(adata: sc.AnnData, layer: str | None = None) -> np.ndarray:
+# compute_characteristic_gene_expression_per_archetype
+def compute_archetype_expression(adata: anndata.AnnData, layer: str | None = None) -> pd.DataFrame:
     """
-    Calculate a weighted pseudobulk expression profile for each archetype.
+    Calculate a weighted average gene expression profile for each archetype.
 
     This function computes the weighted average of gene expression across cells for each archetype.
     The weights should be based on the distance of cells to the archetypes, as computed by `calculate_weights`.
 
     Parameters
     ----------
-    adata : sc.AnnData
+    adata : anndata.AnnData
         An AnnData object containing the gene expression data and weights. The weights should be stored in
         `adata.obsm["cell_weights"]` as a 2D array of shape (n_samples, n_archetypes).
-    layer : str, optional (default=None)
+    layer : str, default `None`
         The layer of the AnnData object to use for gene expression. If `None`, `adata.X` is used. For Pareto analysis of AA data,
         z-scaled data is recommended.
 
     Returns
     -------
-    np.ndarray
-        A 2D array of shape (n_archetypes, n_genes) representing the weighted pseudobulk expression profiles.
+    pd.DataFrame
+        A DataFrame of shape (n_archetypes, n_genes) with weighted pseudobulk expression profiles.
     """
+    if "cell_weights" not in adata.obsm:
+        raise ValueError("No weights available. Please run compute_archetype_weights()")
     weights = adata.obsm["cell_weights"].T
+
     if layer is None:
         expr = adata.X
+    elif layer not in adata.layers:
+        raise ValueError("Invalid layer")
     else:
         expr = adata.layers[layer]
+
     pseudobulk = np.einsum("ij,jk->ik", weights, expr)
     pseudobulk /= weights.sum(axis=1, keepdims=True)
 
     pseudobulk_df = pd.DataFrame(pseudobulk, columns=adata.var_names)
+    pseudobulk_df.columns.name = None
 
     return pseudobulk_df
 
 
-def extract_top_processes(
+def extract_enriched_processes(
     est: pd.DataFrame,
     pval: pd.DataFrame,
     order: str = "desc",
     n: int = 20,
     p_threshold: float = 0.05,
-) -> dict[str, pd.DataFrame]:
+) -> dict[int, pd.DataFrame]:
     """
-    Extract the top enriched biological processes based on statistical significance.
+    Extract top enriched biological processes for each archetype based on significance and enrichment score.
 
-    This function filters and ranks the most enriched biological processes from the decoupler output
-    based on estimated enrichment scores (`est`) and corresponding p-values (`pval`) below the
-    specified threshold (`p_treshold`).
+    This function filters and ranks biological processes using enrichment estimates (`est`) and p-values (`pval`)
+    from decoupler output. For each archetype, it selects the top `n` processes with p-values below `p_threshold`,
+    optionally sorting by the highest or lowest enrichment scores. It also computes a "specificity" score indicating
+    how uniquely enriched a process is for a given archetype compared to others.
 
     Parameters
     ----------
-    est : pd.DataFrame
+    est : `pd.DataFrame`
         A DataFrame of shape (n_archetypes, n_processes) containing the estimated enrichment scores
         for each process and archetype.
-    pval : pd.DataFrame
+    pval : `pd.DataFrame`
         A DataFrame of shape (n_archetypes, n_processes) containing the p-values corresponding to
         the enrichment scores in `est`.
-    order : str, optional (default="desc")
-        The sorting order for selecting the top processes:
+    order : str, default `"desc"`
+        The sorting order for selecting the top processes. Options are:
+
         - "desc": Selects the top `n` processes with the highest enrichment scores.
         - "asc": Selects the top `n` processes with the lowest enrichment scores.
-    n : int, optional (default=20)
+    n : int, default `20`
         The number of top processes to extract per archetype.
-    p_threshold : float, optional (default=0.05)
+    p_threshold : float, default `0.05`
         The p-value threshold for filtering processes. Only processes with p-values below this
         threshold are considered.
 
     Returns
     -------
-    Dict[str, pd.DataFrame]
-        A dictionary where keys are of the form "archetype_X" and values are
-        DataFrames containing the top `n` enriched processes for each archetype. Each DataFrame
-        has two columns:
-        - "Process": The name of the biological process.
-        - "Score": The enrichment score for the process.
+    dict[int, pd.DataFrame]
+        A dictionary mapping each archetype index to a DataFrame of the top `n` enriched processes.
+        Each DataFrame has the following columns:
+        - "Process": Name of the biological process.
+        - "{archetype indices}": Enrichment score for that process.
+        - "specificity": A score indicating how uniquely enriched the process is in the given archetype.
     """
     # Validate input
+    if not ((p_threshold > 0.0) and (p_threshold <= 1.0)):
+        raise ValueError("`p_threshold` must be a valid p value")
     if est.shape != pval.shape:
         raise ValueError("`est` and `pval` must have the same shape.")
 
@@ -158,349 +164,166 @@ def extract_top_processes(
         raise ValueError("`order` must be either 'desc' or 'asc'.")
 
     results = {}
-    for archetype in range(est.shape[0]):
+    for arch_idx in range(est.shape[0]):
         # Filter processes based on p-value threshold
-        significant_processes = pval.iloc[archetype] < p_threshold
-        filtered_scores = est.iloc[archetype, list(significant_processes)]
+        significant_processes = pval.columns[pval.iloc[arch_idx] < p_threshold]
 
-        # Sort and select top processes
+        # compute specificity score
+        top_processes = est[significant_processes].T
+        arch_z_score = top_processes[[str(arch_idx)]].values
+        other_z_scores = top_processes[[c for c in top_processes.columns if c != str(arch_idx)]].values
+        top_processes["specificity"] = (arch_z_score - other_z_scores).min(axis=1)
+
+        # filter
         if order == "desc":
-            top_processes = filtered_scores.nlargest(n).reset_index()
+            top_processes = top_processes.nlargest(n=n, columns=f"{arch_idx}").reset_index(names="Process")
         else:
-            top_processes = filtered_scores.nsmallest(n).reset_index()
+            top_processes = top_processes.nsmallest(n=n, columns=f"{arch_idx}").reset_index(names="Process")
 
-        top_processes.columns = ["Process", "Score"]
-        results[f"archetype_{archetype}"] = top_processes
+        results[arch_idx] = top_processes
 
     return results
 
 
-def extract_top_specific_processes(
+def extract_specific_processes(
     est: pd.DataFrame,
     pval: pd.DataFrame,
-    drop_threshold: int = 0,
     n: int = 20,
     p_threshold: float = 0.05,
-):
+) -> dict[int, pd.DataFrame]:
     """
-    Extract the top enriched biological processes that are specific to each archetype.
+    Extract the top biological processes that are uniquely enriched in each archetype.
 
-    This function identifies the most enriched biological processes for each archetype based on
-    estimated enrichment scores (`est`) and corresponding p-values (`pval`) from the decoupler output below the
-    specified threshold (`p_treshold`). It ensures that the selected processes are specific to the archetype by
-    enforcing that their enrichment scores are below a specified threshold (`drop_threshold`) in all other archetypes.
+    This function identifies the top `n` biological processes for each archetype based on their
+    enrichment scores (`est`) and associated p-values (`pval`). Only processes with p-values below
+    `p_threshold` in a given archetype are considered. A "specificity" score is computed for each
+    process, reflecting how much more enriched it is in the target archetype compared to others.
 
     Parameters
     ----------
-    est : pd.DataFrame
+    est : `pd.DataFrame`
         A DataFrame of shape (n_archetypes, n_processes) containing the estimated enrichment scores
         for each process and archetype.
-    pval : pd.DataFrame
+    pval : `pd.DataFrame`
         A DataFrame of shape (n_archetypes, n_processes) containing the p-values corresponding to
         the enrichment scores in `est`.
-    drop_threshold : int, optional (default=20)
-      The enrichment threshold below which processes are dropped.
-    n : int, optional (default=20)
+    n : int, default: `20`
         The number of top processes to extract per archetype.
-    p_threshold : float, optional (default=0.05)
+    p_threshold : float, default: `0.05`
         The p-value threshold for filtering processes. Only processes with p-values below this
         threshold are considered.
 
     Returns
     -------
-    Dict[str, pd.DataFrame]
-        A dictionary where keys are of the form "archetype_X" and values are
-        DataFrames containing the top `n` enriched processes for each archetype that are below a score of
-        `drop_threshold` for all other archetypes.
+    dict : [int, pd.DataFrame]
+        A dictionary mapping each archetype index to a DataFrame containing the top `n` processes
+        specific to that archetype. Each DataFrame includes:
+        - "Process": Name of the biological process.
+        - "{archetype indices}": Enrichment score in the given archetype.
+        - "specificity": Score indicating how uniquely enriched the process is compared to other archetypes.
     """
+    # Validate input
+    if not ((p_threshold > 0.0) and (p_threshold <= 1.0)):
+        raise ValueError("`p_threshold` must be a valid p value")
     if est.shape != pval.shape:
         raise ValueError("`est` and `pval` must have the same shape.")
 
     results = {}
-    for archetype in range(est.shape[0]):
+    for arch_idx in range(est.shape[0]):
         # Filter processes based on p-value threshold
-        significant_processes = pval.iloc[archetype] < p_threshold
-        top_processes = est.iloc[archetype, list(significant_processes)].nlargest(n).index
+        significant_processes = pval.columns[pval.iloc[arch_idx] < p_threshold]
 
-        # Filter processes based on drop threshold
-        subset = est.loc[:, top_processes]
-        subset.index = subset.index.astype(int)
-        filtered_processes = top_processes[(subset.drop(index=archetype) < drop_threshold).all(axis=0)]
+        # compute specificity score
+        top_processes = est[significant_processes].T
+        arch_z_score = top_processes[[str(arch_idx)]].values
+        other_z_scores = top_processes[[c for c in top_processes.columns if c != str(arch_idx)]].values
+        top_processes["specificity"] = (arch_z_score - other_z_scores).min(axis=1)
+        top_processes = top_processes.nlargest(n=n, columns="specificity").reset_index(names="Process")
 
-        results[f"archetype_{archetype}"] = est.loc[:, filtered_processes].copy()
+        results[arch_idx] = top_processes.copy()
 
     return results
 
 
-def meta_enrichment(adata: sc.AnnData, meta: str) -> pd.DataFrame:
+def compute_meta_enrichment(adata: anndata.AnnData, meta_col: str, datatype: str = "automatic") -> pd.DataFrame:
     """
-    Compute the weighted enrichment of metadata categories across archetypes.
+    Compute the enrichment of metadata categories across archetypes.
 
-    This function performs the following steps:
-    1. One-hot encodes the categorical metadata.
-    2. Normalizes the one-hot encoded metadata to sum to 1 for each category.
-    3. Computes the weighted enrichment of each metadata category for each archetype using the weights stored in `adata.obsm["cell_weights"]`.
+    This function estimates how enriched each metadata category is within each archetype using
+    a weighted average approach. Weights are based on each cell’s contribution to each archetype
+    (`adata.obsm["cell_weights"]`).It supports both categorical and continuous metadata.
+
+    Steps for categorical data:
+        1. One-hot encode the metadata column from `adata.obs[meta_col]`.
+        2. Normalize the metadata so that the sum for each category equals 1 (column-wise).
+        3. Compute weighted enrichment using cell weights.
+        4. Normalize the resulting enrichment scores across metadata categories for each archetype (row-wise).
+
+    Steps for continuous data:
+        1. Compute the weighted average of the metadata per archetype.
 
     Parameters
     ----------
-    adata : sc.AnnData
-        An AnnData object containing the metadata in `adata.obs[meta]` and weights in `adata.obsm["cell_weights"]`.
-    meta : str
+    adata : anndata.AnnData
+        AnnData object with categorical metadata in `adata.obs[meta_col]` and archetype weights
+        in `adata.obsm["cell_weights"]`
+    meta_col : str
         The name of the categorical metadata column in `adata.obs` to use for enrichment analysis.
+    datatype : str, default `automatic`
+        Specifies how to interpret the metadata column:
+        - "automatic": infers type based on column dtype.
+        - "categorical": treats the column as categorical and one-hot encodes it.
+        - "continuous": treats the column as numeric and computes weighted averages.
 
     Returns
     -------
     pd.DataFrame
-        A DataFrame of shape (n_archetypes, n_categories) containing the normalized enrichment of a metadata category for a given archetypes.
+        A DataFrame of shape (n_archetypes, n_categories) for categorical data or
+        (n_archetypes, 1) for continuous data, containing normalized enrichment scores
+        or weighted averages respectively.
     """
-    metadata = adata.obs[meta]
+    if meta_col not in adata.obs:
+        raise ValueError("Metadata column does not exist")
+    if "cell_weights" not in adata.obsm:
+        raise ValueError("No weights available. Please run compute_archetype_weights()")
+
+    metadata = adata.obs[meta_col]
     weights = adata.obsm["cell_weights"].T
 
-    # One-hot encoding of metadata
-    df_encoded = pd.get_dummies(metadata).astype(float)
-    # Normalization
-    df_encoded = df_encoded / df_encoded.values.sum(axis=0, keepdims=True)
+    if datatype == "automatic":
+        if pd.api.types.is_numeric_dtype(metadata):
+            mode = "continuous"
+            metadata = metadata.to_numpy(dtype="float")
+        elif pd.api.types.is_string_dtype(metadata):
+            mode = "categorical"
+        else:
+            raise ValueError("Not a valid data type detected")
+    elif datatype == "continuous" or datatype == "categorical":
+        mode = datatype
+    else:
+        raise ValueError("Not a valid data type")
 
-    # Compute weighted enrichment
-    weighted_meta = np.einsum("ij,jk->ik", weights, df_encoded)
-    weighted_meta /= weights.sum(axis=1, keepdims=True)
+    if mode == "categorical":
+        # One-hot encoding of metadata
+        df_encoded = pd.get_dummies(metadata).astype(float)
+        # Normalization
+        df_encoded = df_encoded / df_encoded.values.sum(axis=0, keepdims=True)
 
-    # Normalization
-    weighted_meta = weighted_meta / np.sum(weighted_meta, axis=1, keepdims=True)
-    weighted_meta_df = pd.DataFrame(weighted_meta, columns=df_encoded.columns)
+        # Compute weighted enrichment
+        weighted_meta = np.einsum("ij,jk->ik", weights, df_encoded)
+        weighted_meta /= weights.sum(axis=1, keepdims=True)
+
+        # Normalization
+        weighted_meta = weighted_meta / np.sum(weighted_meta, axis=1, keepdims=True)
+        weighted_meta_df = pd.DataFrame(weighted_meta, columns=df_encoded.columns)
+
+    elif mode == "continuous":
+        metadata = np.asarray(metadata, dtype=float).reshape(-1, 1)
+
+        # Compute weighted enrichment
+        weighted_meta = np.einsum("ij,jk->ik", weights, metadata)
+        weighted_meta /= weights.sum(axis=1, keepdims=True)
+
+        weighted_meta_df = pd.DataFrame(weighted_meta, columns=[meta_col])
 
     return weighted_meta_df
-
-
-def barplot_meta_enrichment(meta_enrich: pd.DataFrame, meta: str = "Meta"):
-    """
-    Parameters
-    ----------
-    meta_enrich: pd.DataFrame
-        Output of meta_enrichment(), a pd.DataFrame containing the enrichment of meta categories (columns) for all archetypes (rows).
-    meta: str, optional
-        The name for the metadata.
-
-    Returns
-    -------
-    pn.ggplot.ggplot
-        A stacked bar plot.
-    """
-    # Prepare data
-    meta_enrich = meta_enrich.reset_index().rename(columns={"index": "archetype"})
-    meta_enrich_long = meta_enrich.melt(id_vars=["archetype"], var_name="Meta", value_name="Normalized_Enrichment")
-
-    # Create plot
-    plot = (
-        pn.ggplot(
-            meta_enrich_long,
-            pn.aes(x="factor(archetype)", y="Normalized_Enrichment", fill="Meta"),
-        )
-        + pn.geom_bar(stat="identity", position="stack")
-        + pn.theme_matplotlib()
-        + pn.scale_fill_brewer(type="qual", palette="Dark2")
-        + pn.labs(
-            title="Meta Enrichment Across Archetypes",
-            x="Archetype",
-            y="Normalized Enrichment",
-            fill=meta,
-        )
-    )
-    return plot
-
-
-def heatmap_meta_enrichment(meta_enrich: pd.DataFrame, meta: str | None = "Meta"):
-    """
-    Parameters
-    ----------
-    meta_enrich: pd.DataFrame
-        Output of meta_enrichment(), a pd.DataFrame containing the enrichment of meta categories (columns) for all archetypes (rows).
-    meta: str, optional
-        The name for the metadata.
-
-    Returns
-    -------
-    pn.ggplot.ggplot
-        A heatmap.
-    """
-    # Prepare data
-    meta_enrich = meta_enrich.reset_index().rename(columns={"index": "archetype"})
-    meta_enrich_long = meta_enrich.melt(id_vars=["archetype"], var_name="Meta", value_name="Normalized_Enrichment")
-
-    # Create plot
-    plot = (
-        pn.ggplot(meta_enrich_long, pn.aes("archetype", "Meta", fill="Normalized_Enrichment"))
-        + pn.geom_tile()
-        + pn.scale_fill_continuous(cmap_name="Blues")
-        + pn.theme_matplotlib()
-        + pn.labs(title="Heatmap", x="Archetype", y=meta, fill=" Normalized \nEnrichment")
-    )
-    return plot
-
-
-def radarplot_meta_enrichment(meta_enrich: pd.DataFrame):
-    """
-    Parameters
-    ----------
-    meta_enrich: pd.DataFrame
-        Output of meta_enrichment(), a pd.DataFrame containing the enrichment of meta categories (columns) for all archetypes (rows).
-
-    Returns
-    -------
-    plt.pyplot.Figure
-        Radar plots for all archetypes.
-    """
-    # Prepare data
-    meta_enrich = meta_enrich.T.reset_index().rename(columns={"index": "Meta_feature"})
-
-    # Function to create a radar plot for a given row
-    def make_radar(row, title, color):
-        # Set number of meta categories
-        categories = list(meta_enrich)[1:]
-        N = len(categories)
-
-        # Calculate angles for the radar plot
-        angles = [n / float(N) * 2 * pi for n in range(N)]
-        angles += angles[:1]
-
-        # Initialise the radar plot
-        ax = plt.subplot(int(np.ceil(len(meta_enrich) / 2)), 2, row + 1, polar=True)
-
-        # Put first axis on top:
-        ax.set_theta_offset(pi / 2)
-        ax.set_theta_direction(-1)
-
-        # One axe per variable and add labels
-        archetype_label = [f"A{i}" for i in range(len(list(meta_enrich)[1:]))]
-        plt.xticks(angles[:-1], archetype_label, color="grey", size=8)
-
-        # Draw ylabels
-        ax.set_rlabel_position(0)
-        plt.yticks(
-            [0, 0.25, 0.5, 0.75, 1],
-            ["0", "0.25", "0.50", "0.75", "1.0"],
-            color="grey",
-            size=7,
-        )
-        plt.ylim(0, 1)
-
-        # Draw plot
-        values = meta_enrich.loc[row].drop("Meta_feature").values.flatten().tolist()
-        values += values[:1]
-        ax.plot(angles, values, color=color, linewidth=2, linestyle="solid")
-        ax.fill(angles, values, color=color, alpha=0.4)
-
-        # Add a title
-        plt.title(title, size=11, color=color, y=1.065)
-
-    # Initialize the figure
-    my_dpi = 96
-    plt.figure(figsize=(1000 / my_dpi, 1000 / my_dpi), dpi=my_dpi)
-
-    # Create a color palette:
-    my_palette = plt.colormaps.get_cmap("Dark2")
-
-    # Loop to plot
-    for row in range(0, len(meta_enrich.index)):
-        make_radar(
-            row=row,
-            title=f"Feature: {meta_enrich['Meta_feature'][row]}",
-            color=my_palette(row),
-        )
-
-    return plt
-
-
-def plot_functional_enrichment(top_features, show: bool = True):
-    """
-    Generate bar plots for functional enrichment data across archetypes.
-
-    Parameters
-    ----------
-    top_features : dict
-        A dictionary where keys are archetype names ('archetype_0', 'archetype_1',...) and values are pd.DataFrames
-        containing the data to plot. Each DataFrame should have a column for the feature ('Process') and a column
-        for the score ('Score')."
-    show: bool, optional
-        If the plots should be printed.
-
-    Returns
-    -------
-    list
-        A list of `plotnine.ggplot` objects, one for each archetype.
-    """
-    plots = []
-    # Loop through archetypes
-    for i in range(len(top_features)):
-        key = f"archetype_{i}"  # Construct the key dynamically
-        data = top_features[key]
-
-        # Order column
-        data["Process"] = pd.Categorical(data["Process"], categories=data["Process"].tolist(), ordered=True)
-
-        # Create plot
-        plot = (
-            pn.ggplot(data, pn.aes(x="Process", y="Score", fill="Score"))
-            + pn.geom_bar(stat="identity")
-            + pn.labs(
-                title=f"Enrichment at archetype {i}",
-                x="Feature",
-                y="Enrichment score",
-                fill="ProEnrichment scorecess",
-            )
-            + pn.theme_matplotlib()
-            + pn.theme(figure_size=(15, 5))
-            + pn.coord_flip()
-            + pn.scale_fill_gradient2(
-                low="blue",
-                mid="lightgrey",
-                high="red",
-                midpoint=0,
-            )
-        )
-        if show:
-            plot.show()
-        plots.append(plot)
-
-    # Return the list of plots
-    return plots
-
-
-def plot_enrichment_comparison(est: pd.DataFrame, features: str | list[str] | pd.Series):
-    """
-    Plots a grouped bar plot comparing enrichment scores across archetypes for a given set of features.
-
-    Parameters
-    ----------
-    est : pandas.DataFrame
-        A DataFrame containing enrichment scores. Rows represent archetypes, and columns represent features.
-    features : str, list of str, or pd.Series
-        A list of feature names (columns in `est`) to include in the plot.
-
-    Returns
-    -------
-    plot : plotnine.ggplot.ggplot
-        A grouped bar plot visualizing the enrichment scores for the specified features across archetypes."
-    """
-    # Subset the DataFrame to include only the specified features
-    enrich_subset = est[features].reset_index().rename(columns={"index": "archetype"})
-
-    # Convert the DataFrame from wide to long format for plotting
-    enrich_long = enrich_subset.melt(id_vars=["archetype"], var_name="Feature", value_name="Enrichment")
-
-    # Create plot
-    plot = (
-        pn.ggplot(enrich_long, pn.aes(x="Feature", y="Enrichment", fill="factor(archetype)"))
-        + pn.geom_bar(stat="identity", position=pn.position_dodge())
-        + pn.theme_matplotlib()
-        + pn.scale_fill_brewer(type="qual", palette="Dark2")
-        + pn.labs(
-            x="Features",
-            y="Enrichment score",
-            fill="Archetype",
-            title="Enrichment Comparison",
-        )
-        + pn.theme(figure_size=(10, 5))
-        + pn.coord_flip()
-    )
-    return plot

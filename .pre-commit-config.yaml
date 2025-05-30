@@ -1,4 +1,8 @@
 fail_fast: false # do not stop after failure (can still interupt manually...)
+
+ci:
+    skip: [testing] # pre-commit.ci should ignore the testing hook
+
 repos:
   # Add some general purpose useful hooks
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -24,8 +28,9 @@ repos:
       # Check for python syntax errors
       - id: check-ast
 
+  # formating / linting with ruff
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.9
+    rev: v0.11.10
     hooks:
       - id: ruff
         types_or: [python] # ignore jupyter for now [python, jupyter]
@@ -33,20 +38,19 @@ repos:
       - id: ruff-format
         types_or: [python] # ignore jupyter for now [python, jupyter]
 
-  # pytest hook to run tests on commit
-  - repo: local
-    hooks:
-      - id: pytest
-        name: Run pytest
-        #entry: pytest --cov partipy --cov-report=html
-        entry: pytest
-        language: system
-        types: [python]
-        pass_filenames: false
-        always_run: true
-
   # type checking
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.15.0
     hooks:
       - id: mypy
+
+  # pytest hook to run tests on commit
+  # - repo: local
+  #   hooks:
+  #     - id: testing
+  #       name: Run pytest
+  #       entry: uvx hatch run hatch-test.py3.10-stable:pytest
+  #       language: system
+  #       types: [python]
+  #       pass_filenames: false # ignore file changes?
+  #       always_run: true

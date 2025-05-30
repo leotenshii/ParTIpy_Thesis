@@ -1,19 +1,18 @@
-# compiled code
-*.pyc
-
 # IDE stuff
 .vscode/
 
-# caches
+# caches and compiled files
+*.pyc
 __pycache__/
 .mypy_cache
 .ruff_cache
 .pytest_cache
+.venv/
 
-# data directory
-data/*
+# Distribution / packaging
+/dist/
 
-# mac stuff
+# temp files
 .DS_Store
 
 # package stuff
@@ -21,5 +20,19 @@ partipy.egg-info/
 build/*
 .coverage
 
-# others
-spams
+# docs
+/docs/_build/
+/docs/generated/
+docs/api/generated
+/docs/notebooks/data
+/docs/notebooks/*.h5ad
+/docs/notebooks/*.sqlite
+/docs/notebooks/*.txt.gz
+
+# log files
+*.log
+.coverage*
+coverage.xml
+
+# jupyter
+.ipynb_checkpoints/

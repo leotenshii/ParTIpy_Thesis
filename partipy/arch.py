@@ -1,23 +1,21 @@
-"""
-Class for archetypal analysis
-
-Note: notation used X ≈ A · B · X = A · Z
-
-Code adapted from https://github.com/atmguille/archetypal-analysis (by Guillermo García Cobo)
-"""
+"""Class for for fitting archetypal analysis models"""
 
 import numpy as np
-import scanpy as sc
 
+from ._docs import docs
 from .const import (
     DEFAULT_INIT,
+    DEFAULT_MAX_ITER,
     DEFAULT_OPTIM,
+    DEFAULT_REL_TOL,
     DEFAULT_WEIGHT,
     INIT_ALGS,
+    MIN_ITERATIONS,
     OPTIM_ALGS,
     WEIGHT_ALGS,
 )
-from .initialize import _furthest_sum_init, _random_init
+from .coreset import construct_coreset, construct_lightweight_coreset, construct_uniform_coreset
+from .initialize import _init_A, _init_furthest_sum, _init_plus_plus, _init_uniform
 from .optim import (
     _compute_A_frank_wolfe,
     _compute_A_projected_gradients,
@@ -25,54 +23,63 @@ from .optim import (
     _compute_B_frank_wolfe,
     _compute_B_projected_gradients,
     _compute_B_regularized_nnls,
+    _compute_RSS_AZ,
 )
-from .weights import compute_bisquare_weights
+from .weights import compute_bisquare_weights, compute_huber_weights
 
 
+@docs.dedent
 class AA:
-    """
+    r"""
     Archetypal Analysis approximates data points as a convex combination of a set of archetypes, which are themselves convex combinations of the data points.
     The goal is to find the best approximation for a given number of archetypes, representing the structure of the data in a lower-dimensional space.
 
     The model is defined as follows:
-        X ≈ A · B · X = A · Z
+
+    .. math::
+
+        X \approx A B X = A Z
 
     where:
         - X is the data point matrix.
         - A is the coefficient matrix mapping each data point to a convex combination of archetypes.
         - B is the coefficient matrix mapping each archetype to a convex combination of data points.
-        - Z = B · X is the matrix containing the archetypes coordinates.
+        - Z = B X is the matrix containing the archetypes coordinates.
 
-    The optimization problem minimalizes the residual sum of squares (RSS)
-        RSS = ||X - A · Z||^2
+    The optimization problem minimalizes the residual sum of squares (RSS) RSS = ||X - A Z||^2
     subject to the constraints that A and B are non-negative and their rows sum to 1, ensuring convex combinations.
 
     Parameters
     ----------
     n_archetypes : int
         Number of archetypes to compute.
-    init : str, optional (default="furthest_sum)
-        Initialization method for the archetypes. Options are:
-        - "random": Random initialization.
-        - "furthest_sum": Utilizes the furthest sum algorithm (recommended).
-    optim: str, optional (default="projected_gradients")
-            Optimization algorithm to use. Options are:
-        - "regularized_nnls": Regularized non-negative least squares.
-        - "projected_gradients": Projected gradient descent (PCHA).
-        - "frank_wolfe": Frank-Wolfe algorithm.
-    weight : str or None, optional (default: None)
-        Weighting scheme for robust archetypal analysis. Options:
-        - None: No weighting.
-        - "bisquare": Bisquare weighting.
-    max_iter : int, optional (default: 100)
-        Maximum number of iterations for the optimization.
-    derivative_max_iter : int, optional (default: 100)
-        Maximum number of iterations for derivative-based optimization steps.
-    tol : float, optional (default: 1e-6)
-        Tolerance for convergence. The optimization stops if the relative change in RSS
-        falls below this threshold.
-    verbose : bool, optional (default: False)
-        If True, print progress during optimization.
+    %(init)s
+    %(optim)s
+    %(weight)s
+    %(max_iter)s
+    %(rel_tol)s
+    early_stopping : bool, default `True`
+        Whether to stop the optimization early if the relative change in RSS is below a certain threshold.
+    use_coreset : bool, default `False`
+        Whether to use a coreset for the optimization. If True, a coreset is constructed from the data.
+    coreset_flavor : {"default", "lightweight_kmeans", "uniform"}, default `default`
+        The method used to construct the coreset. Options:
+
+        - "default": Uses the default coreset construction method.
+        - "lightweight_kmeans": Uses a lightweight k-means approach to construct the coreset.
+        - "uniform": Constructs a uniform coreset.
+    coreset_fraction : float, default `0.1`
+        Fraction of the data to use for the coreset. Only used if `use_coreset` is True.
+    coreset_size : int, default: `None`
+        Size of the coreset to use. If None, it is set to `n_samples * coreset_fraction`.
+    centering : bool, default `True`
+        Whether to center the data by subtracting the feature means before optimization.
+    scaling : bool, default `True`
+        Whether to scale the data globally by dividing by the global norm before optimization.
+    %(verbose)s
+    %(seed)s
+    optim_kwargs : dict
+        Additional arguments that are passed to `compute_A` and `compute_B`.
     """
 
     def __init__(
@@ -81,19 +88,35 @@ class AA:
         init: str = DEFAULT_INIT,
         optim: str = DEFAULT_OPTIM,
         weight: None | str = DEFAULT_WEIGHT,
-        max_iter: int = 100,
-        derivative_max_iter: int = 100,
-        tol: float = 1e-6,
+        max_iter: int = DEFAULT_MAX_ITER,
+        rel_tol: float = DEFAULT_REL_TOL,
+        early_stopping: bool = True,
+        use_coreset: bool = False,
+        coreset_flavor: str = "default",
+        coreset_fraction: float = 0.1,
+        coreset_size: None | int = None,
+        centering: bool = True,
+        scaling: bool = True,
         verbose: bool = False,
+        seed: int = 42,
+        **optim_kwargs,
     ):
         self.n_archetypes = n_archetypes
         self.init = init
         self.optim = optim
         self.weight = weight
         self.max_iter = max_iter
-        self.deriv_max_iter = derivative_max_iter
-        self.tol = tol
+        self.rel_tol = rel_tol
+        self.early_stopping = early_stopping
+        self.use_coreset = use_coreset
+        self.coreset_flavor = coreset_flavor
+        self.coreset_fraction = coreset_fraction
+        self.coreset_size = coreset_size
+        self.centering = centering
+        self.scaling = scaling
         self.verbose = verbose
+        self.seed = seed
+        self.optim_kwargs = optim_kwargs
         # NOTE: I don't want to use here type annotation np.ndarray: None | np.ndarray
         # because it makes little sense for downstream type checking
         self.A: np.ndarray = None  # type: ignore[assignment]
@@ -101,42 +124,59 @@ class AA:
         self.Z: np.ndarray = None  # type: ignore[assignment]
         self.n_samples: int = None  # type: ignore[assignment]
         self.n_features: int = None  # type: ignore[assignment]
-        self.muA, self.muB = None, None
         self.RSS: float | None = None
-        self.RSS_trace: list[float | None] | np.ndarray = []
-        self.varexpl = None
-        self.adata = None
+        self.RSS_trace: np.ndarray = np.zeros(max_iter, dtype=np.float32)
+        self.varexpl: float = None  # type: ignore[assignment]
+        self.fitting_info: dict
 
         # checks
-        assert self.init in INIT_ALGS
-        assert self.optim in OPTIM_ALGS
-        assert self.weight in WEIGHT_ALGS
+        if self.init not in INIT_ALGS:
+            raise ValueError(f"Initialization method '{self.init}' is not supported. Must be one of {INIT_ALGS}.")
+
+        if self.optim not in OPTIM_ALGS:
+            raise ValueError(f"Optimization algorithm '{self.optim}' is not supported. Must be one of {OPTIM_ALGS}.")
+
+        if self.weight not in WEIGHT_ALGS:
+            raise ValueError(f"Weighting method '{self.weight}' is not supported. Must be one of {WEIGHT_ALGS}.")
+
+        if self.max_iter < 0:
+            raise ValueError(f"max_iter must be non-negative, got {self.max_iter}.")
+
+        if self.weight is not None and early_stopping is not False:
+            raise ValueError(
+                "Early stopping must be disabled (early_stopping=False) when using weighted/robust"
+                "archetypal analysis. This is because optimization with weights does not lead to RSS reduction"
+            )
+
+        if self.use_coreset and self.weight:
+            raise ValueError(
+                "It is not yet implemented to use robust archetypal analysis and coresets at the same time"
+            )
 
     def fit(self, X: np.ndarray):
         """
         Computes the archetypes and the RSS from the data X, which are stored
-        in the corresponding attributes
-        :param X: data matrix, with shape (n_samples, n_features)
-        :return: self
-        """
-        if isinstance(X, sc.AnnData):
-            if "X_pca" not in X.obsm:
-                raise ValueError(
-                    "X_pca not in AnnData object. Please use run PCA and set_dimension() to add both to the AnnData object."
-                )
-            self.adata = X
-            X = X.obsm["X_pca"][:, : X.uns["n_pcs"]]
+        in the corresponding attributes.
 
+        Parameters
+        ----------
+        X : `np.ndarray`
+            Data matrix with shape (n_samples, n_features).
+
+        Returns
+        -------
+        self : AA
+            The instance of the AA class, with computed archetypes and RSS stored as attributes.
+        """
         self.n_samples, self.n_features = X.shape
 
-        # ensure C-contiguous format for numba
-        X = np.ascontiguousarray(X)
-
         # set the initalization function
-        if self.init == "random":
-            initialize_B = _random_init
+        if self.init == "uniform":
+            initialize_B = _init_uniform
         elif self.init == "furthest_sum":
-            initialize_B = _furthest_sum_init
+            initialize_B = _init_furthest_sum
+        elif self.init == "plus_plus":
+            initialize_B = _init_plus_plus
         else:
             raise NotImplementedError()
 
@@ -157,66 +197,184 @@ class AA:
         if self.weight:
             if self.weight == "bisquare":
                 compute_weights = compute_bisquare_weights
+            elif self.weight == "huber":
+                compute_weights = compute_huber_weights
             else:
                 raise NotImplementedError()
 
+        # ensure C-contiguous format for numba (plus using np.float32 datatype)
+        X = np.ascontiguousarray(
+            X, dtype=np.float32
+        ).copy()  # if we don't explicitly copy here, multiprocessing can fail
+
+        # center X by substracting the feature means
+        if self.centering:
+            feature_means = X.mean(axis=0, keepdims=True)
+            X -= feature_means
+
+        # scale X globally (needs to happen before we compute weights, otherwise the weights are off)
+        # TODO: Test whether we can also just apply the same scaling to the weights
+        if self.scaling:
+            global_scale = np.linalg.norm(X) / np.sqrt(np.prod(X.shape))
+            X /= global_scale
+
+        # keep the raw X
+        X_raw = X.copy()
+
+        # construct the coreset and initialize A
+        if self.use_coreset:
+            if self.coreset_size is None:
+                self.coreset_size = int(self.n_samples * self.coreset_fraction)
+
+            if self.coreset_flavor == "default":
+                coreset_indices, W = construct_coreset(X=X, coreset_size=self.coreset_size, seed=self.seed)
+            elif self.coreset_flavor == "lightweight_kmeans":
+                coreset_indices, W = construct_lightweight_coreset(X=X, coreset_size=self.coreset_size, seed=self.seed)
+            elif self.coreset_flavor == "uniform":
+                coreset_indices, W = construct_uniform_coreset(X=X, coreset_size=self.coreset_size, seed=self.seed)
+            else:
+                raise NotImplementedError()
+
+            if self.verbose:
+                print(f"coreset size = {self.coreset_size} | coreset flavor = {self.coreset_flavor}")
+
+            X = X[coreset_indices, :].copy()  # TODO: probably no copy needed here!
+            A = _init_A(n_samples=self.coreset_size, n_archetypes=self.n_archetypes, seed=self.seed)
+
+        else:
+            A = _init_A(n_samples=self.n_samples, n_archetypes=self.n_archetypes, seed=self.seed)
+
         # initialize B and the archetypes Z
-        B = initialize_B(X=X, n_archetypes=self.n_archetypes)
+        B, inital_indices = initialize_B(X=X, n_archetypes=self.n_archetypes, seed=self.seed, return_indices=True)
         Z = B @ X
 
-        # randomly initialize A
-        A = -np.log(np.random.random((self.n_samples, self.n_archetypes)))
-        A /= np.sum(A, axis=1, keepdims=True)
-
-        TSS = np.sum(X * X)
-        prev_RSS = None
-
-        W = np.ones(X.shape[0]) if self.weight else None
-
-        for _ in range(self.max_iter):
-            X_w = np.diag(W) @ X if self.weight else X  # type: ignore[arg-type]
-            A = compute_A(X_w, Z, A, self.deriv_max_iter)
-            B = compute_B(X_w, A, B, self.deriv_max_iter)
-            Z = B @ X_w
-
-            # compute residuals using the original data
-            A_0 = compute_A(X, Z, A, self.deriv_max_iter) if self.weight else A
-            R = X - A_0 @ Z
-            W = compute_weights(R) if self.weight else None
-
-            RSS = np.linalg.norm(R) ** 2
-            if (prev_RSS is not None) and ((abs(prev_RSS - RSS) / prev_RSS) < self.tol):
-                break
-            prev_RSS = RSS
-            self.RSS_trace.append(float(RSS))  # type: ignore[union-attr]
-
-        # Recalculate A and B using the unweighted data
+        # initialize weights
         if self.weight:
-            A = compute_A(X, Z, A, self.deriv_max_iter)
-            B = compute_B(X, A, B, self.deriv_max_iter)
-            Z = B @ X
-            RSS = np.linalg.norm(X - A @ Z) ** 2
+            W = np.ones(X.shape[0], dtype=np.float32)
+        elif self.use_coreset:
+            # if we use coreset we only have to weight X a single time
+            WX = W[:, None] * X  # same as np.diag(W) @ X
 
+        TSS = RSS = np.sum(X * X)
+
+        convergence_flag = False
+        for n_iter in range(self.max_iter):
+            if self.weight:
+                WX = W[:, None] * X
+                A = compute_A(WX, Z, A, **self.optim_kwargs)
+                B = compute_B(WX, A, B, **self.optim_kwargs)
+                Z = B @ WX
+
+                # recompute weights based on the original, which are computed using the original data
+                A_0 = compute_A(X, Z, A, **self.optim_kwargs)
+                R = X - A_0 @ Z
+                W = compute_weights(R)
+
+            elif self.use_coreset:
+                # compute A using the unweighted data X
+                A = compute_A(X=X, Z=Z, A=A, **self.optim_kwargs)
+                WA = W[:, None] * A
+                B = compute_B(X=X, A=WA, B=B, WX=WX, **self.optim_kwargs)
+                Z = B @ X
+
+            else:
+                A = compute_A(X, Z, A, **self.optim_kwargs)
+                B = compute_B(X, A, B, **self.optim_kwargs)
+                Z = B @ X
+
+            # compute RSS and check for convergence
+            RSS = _compute_RSS_AZ(X=X, A=A, Z=Z)
+            self.RSS_trace[n_iter] = float(RSS)
+            max_window = min(n_iter, 20)
+            rel_delta_RSS_mean_last_n = (
+                np.mean(
+                    (
+                        self.RSS_trace[(n_iter - max_window + 1) : (n_iter + 1)]
+                        - self.RSS_trace[(n_iter - max_window) : (n_iter)]
+                    )
+                    / self.RSS_trace[(n_iter - max_window) : (n_iter)]
+                )
+                if n_iter > 0
+                else np.nan
+            )
+            if self.verbose:
+                print(
+                    f"\riter: {n_iter} | RSS: {RSS:.3f} | rel_delta_RSS: {rel_delta_RSS_mean_last_n:.6f}",
+                    end="",
+                    flush=True,
+                )
+            if np.isnan(RSS) or np.isinf(RSS):
+                print("\nWarning: RSS is NaN or Inf. Stopping optimization.")
+                break
+
+            if (n_iter >= MIN_ITERATIONS) and self.early_stopping:
+                if (rel_delta_RSS_mean_last_n >= 0.0) or (np.abs(rel_delta_RSS_mean_last_n) < self.rel_tol):
+                    convergence_flag = True
+                    break
+        if self.verbose:
+            message = (
+                f"\nAlgorithm converged after {n_iter} iterations."
+                if convergence_flag
+                else f"\nAlgorithm did not converge after {n_iter} iterations."
+            )
+            print(message)
+
+        if self.use_coreset:
+            B_full = np.zeros((self.n_archetypes, self.n_samples))
+            for B_col_idx, coreset_idx in enumerate(coreset_indices):
+                B_full[:, coreset_idx] += B[:, B_col_idx]
+            B = B_full
+            Z = B @ X_raw
+            # TODO: change to projected gradients or frank-wolfe here!
+            A = _compute_A_regularized_nnls(X=X_raw, Z=Z, A=None)
+
+        # If using weights, we need to recalculate A and B using the unweighted data
+        if self.weight:
+            A = compute_A(X, Z, A, **self.optim_kwargs)
+            B = compute_B(X, A, B, **self.optim_kwargs)
+            Z = B @ X
+
+        if self.scaling:
+            X *= global_scale
+            X_raw *= global_scale
+            Z *= global_scale
+
+        if self.centering:
+            X += feature_means
+            X_raw += feature_means
+            Z += feature_means
+
+        # save the output
+        TSS = np.sum(X_raw * X_raw)
+        RSS = np.linalg.norm(X_raw - A @ Z) ** 2  # RSS on full TS
+        self.RSS = RSS
+        self.varexpl = (TSS - RSS) / TSS
         self.Z = Z
         self.A = A
         self.B = B
-        self.RSS = float(RSS)
-        self.RSS_trace = np.array(self.RSS_trace)
-        self.varexpl = (TSS - RSS) / TSS
+        self.RSS_trace = self.RSS_trace[self.RSS_trace > 0.0]
+        self.fitting_info = {
+            "conv": convergence_flag if self.max_iter > 0 else None,
+            "n_iter": n_iter if self.max_iter > 0 else None,
+            "coreset_indices": coreset_indices if self.use_coreset else None,
+            "weights": W if (self.use_coreset or self.weight) else None,
+            "inital_indices": inital_indices,
+        }
         return self
-
-    def archetypes(self) -> None | np.ndarray:
-        """
-        Returns the archetypes' matrix
-        :return: archetypes matrix, with shape (n_archetypes, n_features)
-        """
-        return self.Z
 
     def transform(self, X: np.ndarray) -> np.ndarray:
         """
-        Computes the best convex approximation A of X by the archetypes Z
-        :param X: data matrix, with shape (n_samples, n_features)
-        :return: A matrix, with shape (n_samples, n_archetypes)
+        Computes the best convex approximation A of X by the archetypes Z.
+
+        Parameters
+        ----------
+        X : `np.ndarray`
+            Data matrix with shape (n_samples, n_features).
+
+        Returns
+        -------
+        np.ndarray
+            The matrix A with shape (n_samples, n_archetypes).
         """
         if self.optim == "regularized_nnls":
             return _compute_A_regularized_nnls(X, self.Z)
@@ -230,32 +388,3 @@ class AA:
             return _compute_A_frank_wolfe(X, self.Z, A=A_random)
         else:
             raise NotImplementedError()
-
-    def return_all(self) -> tuple:
-        """Return optimized matrices: A, B, Z, and fitting stats: RSS, varexpl."""
-        return self.A, self.B, self.Z, self.RSS_trace, self.varexpl
-
-    def save_to_anndata(self, archetypes_only: bool = True):
-        """
-        Saves the results to the AnnData object provided in fit().
-
-        Parameters
-        ----------
-        archetypes_only: bool
-          If True, only the archetypes (Z) are saved. Otherwise, all results (A, B, Z, RSS, varexpl) are saved.
-        """
-        if self.adata is None:
-            raise ValueError("No AnnData object found. Please provide an AnnData object to fit().")
-
-        if archetypes_only:
-            self.adata.uns["archetypal_analysis"] = {
-                "Z": self.Z,
-            }
-        else:
-            self.adata.uns["archetypal_analysis"] = {
-                "A": self.A,
-                "B": self.B,
-                "Z": self.Z,
-                "RSS": self.RSS_trace,
-                "varexpl": self.varexpl,
-            }
